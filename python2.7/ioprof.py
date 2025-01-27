@@ -16,14 +16,10 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 import sys, getopt, os, re, string, stat, subprocess, math, shlex, time
-from multiprocessing import Pool, Process, Lock, Manager, Value, Array
+from multiprocessing import Process, Lock, Manager, Value, Array
 import multiprocessing
-from argparse import ArgumentParser
-import logging
 
 # Global Variables
-logger = None
-log_format = "[%(levelname)s] %(message)s" # "%(asctime)s [%(levelname)s] %(message)s"
 
 class global_variables:
     #VERBOSE   = False
@@ -31,10 +27,8 @@ class global_variables:
         self.version           = "1.0.0.1"                   # Version string
         self.verbose           = False                       # Verbose logging (-v flag)
         self.debug             = False                       # Debug log level (-x flag)
-        self.single_threaded   = True                        # Single threaded for debug/profiling
+        self.single_threaded   = False                       # Single threaded for debug/profiling
         self.manager           = Manager()                   # Multiprocess sync object
-
-        self.file_list         = []                          # File List
 
         self.io_total          = Value('L', 0)               # Number of total I/O's
         self.read_total        = Value('L', 0)               # Number of buckets read (1 I/O can touch many buckets)
@@ -73,8 +67,8 @@ class global_variables:
         self.thread_bucket_hits_total = 0   # Thread-local total bucket hits (buckets)
         self.thread_read_total = 0          # Thread-local total read count (I/O ops)
         self.thread_write_total = 0         # Thread-local total write count (I/O ops)
-        self.thread_reads = {}              # Thread-local read count dict (buckets)
-        self.thread_writes = {}             # Thread-local write count dict (buckets)
+        self.thread_reads = {}              # Thread-local read count hash (buckets)
+        self.thread_writes = {}             # Thread-local write count hash (buckets)
         self.thread_total_blocks = 0        # Thread-local total blocks accessed (lbas)
         self.thread_max_bucket_hits = 0     # Thread-local maximum bucket hits (bucket hits)
 
@@ -143,212 +137,190 @@ class global_variables:
 # global_variables
 
 ### Print usage
-def usage(g):
+def usage(g, argv):
     name = os.path.basename(__file__)
     #name = argv[0]
-    logger.info("Invalid command\n")
+    print "Invalid command\n"
     #print name + " " + str(argv)
-    print (name, end='')
-    logger.info("\n\nUsage:")
-    logger.info(name + " -m trace -d <dev> -r <runtime> [-v] [-f] # run trace for post-processing later")
-    logger.info(name + " -m post  -t <dev.tar file>     [-v] [-p]   # post-process mode")
-    logger.info(name + " -m live  -d <dev> -r <runtime> [-v]        # live mode")
-    logger.info("\nCommand Line Arguments:")
-    logger.info("-d <dev>            : The device to trace (e.g. /dev/sdb).  You can run traces to multiple devices (e.g. /dev/sda and /dev/sdb)")
-    logger.info("                      at the same time, but please only run 1 trace to a single device (e.g. /dev/sdb) at a time")
-    logger.info("-r <runtime>        : Runtime (seconds) for tracing")
-    logger.info("-t <dev.tar file>   : A .tar file is created during the 'trace' phase.  Please use this file for the 'post' phase")
-    logger.info("                      You can offload this file and run the 'post' phase on another system.")
-    logger.info("-v                  : (OPTIONAL) Print verbose messages.")
-    logger.info("-f                  : (OPTIONAL) Map all files on the device specified by -d <dev> during 'trace' phase to their LBA ranges.")
-    logger.info("                       This is useful for determining the most fequently accessed files, but may take a while on really large filesystems")
-    logger.info("-p                  : (OPTIONAL) Generate a .pdf output file in addition to STDOUT.  This requires 'pdflatex', 'gnuplot' and 'terminal png'")
-    logger.info("                       to be installed.")
+    print name,
+    for opt in argv:
+        print opt,
+    print "\n\nUsage:"
+    print name + " -m trace -d <dev> -r <runtime> [-v] [-f] # run trace for post-processing later"
+    print name + " -m post  -t <dev.tar file>     [-v] [-p]   # post-process mode"
+    print name + " -m live  -d <dev> -r <runtime> [-v]        # live mode"
+    print "\nCommand Line Arguments:"
+    print "-d <dev>            : The device to trace (e.g. /dev/sdb).  You can run traces to multiple devices (e.g. /dev/sda and /dev/sdb)"
+    print "                      at the same time, but please only run 1 trace to a single device (e.g. /dev/sdb) at a time"
+    print "-r <runtime>        : Runtime (seconds) for tracing"
+    print "-t <dev.tar file>   : A .tar file is created during the 'trace' phase.  Please use this file for the 'post' phase"
+    print "                      You can offload this file and run the 'post' phase on another system."
+    print "-v                  : (OPTIONAL) Print verbose messages."
+    print "-f                  : (OPTIONAL) Map all files on the device specified by -d <dev> during 'trace' phase to their LBA ranges."
+    print "                       This is useful for determining the most fequently accessed files, but may take a while on really large filesystems"
+    print "-p                  : (OPTIONAL) Generate a .pdf output file in addition to STDOUT.  This requires 'pdflatex', 'gnuplot' and 'terminal png'"
+    print "                       to be installed."
     sys.exit(-1)
 # usage (DONE)
 
-def set_globals(g, command_args):
-    """
-    Set global vars
-    Arg(s):
-        argv : arguments passed in via command line
-    Return
-        Parsed arguments and build request flag or exception otherwise
-    """
-    global logger
+### Check arguments
+def check_args(g, argv):
 
-    g.mode = command_args.mode
-    g.device = command_args.device
-    g.tarfile = command_args.tarfile
-    logger.info(command_args)
-    g.trace_files = command_args.trace_files
-    g.runtime = command_args.runtime
-    if g.runtime is not None:
-        g.runtime = int(g.runtime)
-        if g.runtime < 3:
-            g.runtime = 3 # Minimum runtime
-    g.verbose = command_args.verbose
-    g.pdf = command_args.pdf
-    g.debug = command_args.debug
-    if g.debug is True:
-        logger.setLevel(logging.DEBUG)
+    # Gather command line arguments
+    try:
+        opts, args = getopt.getopt(argv,"m:d:t:fr:vpx")
+    except getopt.GetoptError as err:
+        print str(err)
+        usage(g,argv)
+
+    # Parse arguments
+    for opt, arg in opts:
+        if opt == '-m':
+            g.mode = arg
+        elif opt == '-d':
+            g.device = arg
+        elif opt == '-t':
+            g.tarfile = arg
+        elif opt == '-f':
+            g.trace_files= True
+        elif opt == '-r':
+            g.runtime = int(arg)
+            if g.runtime < 3:
+                g.runtime = 3 # Min runtime
+        elif opt == '-v':
+            g.verbose = True
+        elif opt == '-p':
+            g.pdf = True
+        elif opt == '-x':
+            g.verbose = True
+            g.debug = True
+        else:
+            usage(g,argv)
 
     # Check arguments
     if g.verbose == True or g.debug == True:
-        logger.warning( "verbose: " + str(g.verbose) + " debug: " + str(g.debug))
+        verbose_print(g, "verbose: " + str(g.verbose) + " debug: " + str(g.debug))
 
     if g.mode == 'live':
-        logger.warning( "LIVE")
+        verbose_print(g, "LIVE")
         if g.device == '' or g.runtime == '':
-            usage(g)
-        logger.debug( "Dev: " + g.device + " Runtime: " + g.runtime)
+            usage(g,argv)
+        debug_print(g, "Dev: " + g.device + " Runtime: " + g.runtime)
         match = re.search("\/dev\/(\S+)", g.device)
         try: 
-            logger.debug(match.group(1))
+            debug_print(g,match.group(1))
             g.device_str = string.replace(match.group(1), "/", "_")
         except:
-            logger.info("Invalid Device Type")
-            usage(g)
+            print "Invalid Device Type"
+            usage(g, argv)
         statinfo = os.stat(g.device)
         if not stat.S_ISBLK(statinfo.st_mode):
-            logger.info("Device " + g.device + " is not a block device")
-            usage(g)
+            print "Device " + g.device + " is not a block device"
+            usage(g,argv)
     elif g.mode == 'post':
-        logger.warning( "POST")
+        verbose_print(g, "POST")
         if g.tarfile == '':
-            usage(g)
+            usage(g,argv)
         match = re.search("(\S+).tar", g.tarfile)
         try:
-            logger.debug(match.group(1))
+            debug_print(g,match.group(1))
             g.device_str = match.group(1)
         except:
-            logger.info("ERROR: invalid tar file" + g.tarfile)
+            print "ERROR: invalid tar file" + g.tarfile
         if g.pdf == True:
-            logger.warning( "PDF Report Output")
+            verbose_print(g, "PDF Report Output")
             check_pdf_prereqs(g)
 
-            logger.info("PDF Report Output - COMING SOON...") # COMING SOON
+            print "PDF Report Output - COMING SOON..." # COMING SOON
             sys.exit(-1) # COMING SOON
         g.fdisk_file = "fdisk." + g.device_str
-        logger.debug( "fdisk_file: " + g.fdisk_file)
+        debug_print(g, "fdisk_file: " + g.fdisk_file)
         g.cleanup.append(g.fdisk_file)
     elif g.mode == 'trace':
-        logger.warning( "TRACE")
+        verbose_print(g, "TRACE")
         check_trace_prereqs(g)
         if g.device == '' or g.runtime == '':
-            usage(g)
-        logger.debug( "Dev: " + g.device + " Runtime: " + str(g.runtime))
+            usage(g,argv)
+        debug_print(g, "Dev: " + g.device + " Runtime: " + str(g.runtime))
         match = re.search("\/dev\/(\S+)", g.device)
         try: 
-            logger.debug(match.group(1))
-            g.device_str = match.group(1)
-            g.device_str = g.device_str.replace("/", "_")
-        except BaseException as ex:
-            logger.info(f"Invalid Device Type: {ex}")
-            usage(g)
-            sys.exit(1)
+            debug_print(g,match.group(1))
+            g.device_str = string.replace(match.group(1), "/", "_")
+        except:
+            print "Invalid Device Type"
+            usage(g, argv)
         statinfo = os.stat(g.device)
-        logger.info(statinfo)
         if not stat.S_ISBLK(statinfo.st_mode):
-            logger.info("Device " + g.device + " is not a block device")
-            usage(g)
-            sys.exit(1)
+            print "Device " + g.device + " is not a block device"
+            usage(g,argv)
     else:
-        usage(g)
+        usage(g,argv)
     return
+# check_args (DONE)
 
-def get_arguments(argv=None):
-    """
-    Parse the script command line arguments
-    Arg(s):
-        argv : arguments passed in via command line
-    Return
-        Parsed arguments and build request flag or exception otherwise
-    """
-    if argv is None:
-        argv = sys.argv
-    else:
-        sys.argv.extend(argv)
+def debug_print(g, message):
+    if g.debug == True:
+        print message
+# debug_print (DONE)
 
-    try:
-        parser = ArgumentParser()
-
-        # Full path log file name
-        parser.add_argument("-m", "--mode", type=str, help="Mode (trace, post, live)")
-        parser.add_argument("-d", "--device", type=str, help="Device to trace, (i.e. -d /dev/nvme0n1)")
-        parser.add_argument("-t", "--tarfile", type=str, help="Tarfile, output from -m trace")
-        parser.add_argument("-r", "--runtime", type=str, help="Runtime in seconds")
-        parser.add_argument("--trace_files", "--f",  action='store_true', default=False, help='Trace Files')
-        parser.add_argument("--verbose", "--v", action='store_true',default=False, help='Print verbose')
-        parser.add_argument( "--pdf", "--p", action='store_true',default=False, help='Output PDF')
-        parser.add_argument("--debug", "--x", action='store_true',default=False, help='Debug mode')
-        
-        # Process arguments
-        return parser.parse_args()
-
-    except BaseException as base_ex:
-        if str(base_ex) != "0":
-            sys.stderr.write('For help use --help\n\n')
-            logger.info(base_ex)
-            sys.exit(1)
-        else:
-            logger.info(base_ex)
-            sys.exit(1)
-        return None
+def verbose_print(g, message):
+    if g.verbose == True:
+        print message
+# verbose_print (DONE)
 
 ### Check prereqs for gnuplot and latex
 def check_pdf_prereqs(g):
-    logger.debug( "check_pdf_prereqs")
+    debug_print(g, "check_pdf_prereqs")
 
     rc = os.system("which gnuplot &> /dev/null")
     if rc != 0:
-        logger.info("ERROR: gnuplot not installed.  Please offload the trace file for processing.")
+        print "ERROR: gnuplot not installed.  Please offload the trace file for processing."
         sys.exit(1)
     else:
-        logger.debug( "which gnuplot: rc=" + str(rc))
+        debug_print(g, "which gnuplot: rc=" + str(rc))
     rc = os.system("which pdflatex &> /dev/null")
     if rc != 0:
-        logger.info("ERROR: pdflatex not installed.  Please offload the trace file for processing.")
+        print "ERROR: pdflatex not installed.  Please offload the trace file for processing."
         sys.exit(1)
     else:
-        logger.debug( "which pdflatex: rc=" + str(rc))
+        debug_print(g, "which pdflatex: rc=" + str(rc))
     rc = os.system("echo 'set terminal png' > pngtest.txt; gnuplot pngtest.txt >/dev/null 2>&1")
     if rc != 0:
-        logger.info("ERROR: gnuplot PNG terminal not installed.  Please offload the trace file for processing.")
+        print "ERROR: gnuplot PNG terminal not installed.  Please offload the trace file for processing."
         sys.exit(1)
     else:
-        logger.debug( "gnuplot pngtest.txt: rc=" + str(rc))
+        debug_print(g, "gnuplot pngtest.txt: rc=" + str(rc))
     return
 # check_pdf_prereqs (DONE)
 
 ### Check prereqs for blktrace
 def check_trace_prereqs(g):
-    logger.debug( "check_trace_prereqs")
-    rc = os.system("which blktrace 1>/dev/null 2>/dev/null")
+    debug_print(g, "check_trace_prereqs")
+    rc = os.system("which blktrace &> /dev/null")
     if rc != 0:
-        logger.info("ERROR: blktrace not installed.  Please install blktrace")
+        print "ERROR: blktrace not installed.  Please install blktrace"
         sys.exit(1)
     else:
-        logger.debug( "which blktrace: rc=" + str(rc))
-    rc = os.system("which blkparse 1>/dev/null 2>/dev/null")
+        debug_print(g, "which blktrace: rc=" + str(rc))
+    rc = os.system("which blkparse &> /dev/null")
     if rc != 0:
-        logger.info("ERROR: blkparse not installed.  Please install blkparse")
+        print "ERROR: blkparse not installed.  Please install blkparse"
         sys.exit(1)
     else:
-        logger.debug( "which blkparse: rc=" + str(rc))
+        debug_print(g, "which blkparse: rc=" + str(rc))
 # check_trace_prereqs (DONE)
 
 ### Check if debugfs is mounted
 def mount_debugfs(g):
-    rc = os.system("mount | grep debugfs 1>/dev/null 2>/dev/null")
+    rc = os.system("mount | grep debugfs &> /dev/null")
     if rc != 0:
-        logger.debug( "Need to mount debugfs")
+        debug_print(g, "Need to mount debugfs")
         rc = os.system("mount -t debugfs debugfs /sys/kernel/debug")
         if rc != 0:
-            logger.info("ERROR: Failed to mount debugfs")
+            print "ERROR: Failed to mount debugfs"
             sys.exit(2)
         else:
-            logger.warning( "Mounted debugfs successfully")
+            verbose_print(g, "Mounted debugfs successfully")
     return
 # mount_debugfs (DONE)
 
@@ -374,17 +346,17 @@ def bucket_to_lba(g, bucket):
 def debugfs_method(g, file):
     extents = []
     file = string.replace(file, g.mountpoint, "")
-    logger.debug( "file: " + file)
+    debug_print(g, "file: " + file)
     cmd = 'debugfs -R "dump_extents ' + file + '" ' + g.device + '  2>/dev/null'
-    logger.debug( cmd)
+    debug_print(g, cmd)
     (rc, extent_out) = run_cmd(g, cmd)
     for line in extent_out:
-        logger.debug( line)
+        debug_print(g, line)
         match = re.search("\s+\d+\/\s+\d+\s+\d+\/\s+\d+\s+\d+\s+-\s+\d+\s+(\d+)\s+-\s+(\d+)", line)
         try:
             g.extents.append(match.group(1) + ":" + match.group(1))
         except:
-            logger.debug( "no match")
+            debug_print(g, "no match")
     return
 # debugfs_method (DONE)
 
@@ -399,14 +371,14 @@ def fs_cluster_to_lba(g, fs_cluster_size, sector_size, io_cluster):
 ### There is some risk that FIBMAP!=1.  Need to address this later
 ### I plan to use the ioctl method because it is 30% faster than the debugfs method
 def ioctl_method(g, file):
-    logger.info("ext3 will be supported once ioctl_method() is supported")
+    print "ext3 will be supported once ioctl_method() is supported"
     sys.exit(-1)
     return
 # ioctl_method (COMING SOON...)
 
 ### Print filetrace files
 def printout(g, file):
-    logger.debug( "printout: " + file)
+    debug_print(g, "printout: " + file)
     cpu_affinity = 0
     filetrace = "filetrace." + g.device_str + "." + str(cpu_affinity) + ".txt"
     fo = open(filetrace, "a")
@@ -414,17 +386,17 @@ def printout(g, file):
         fo.write(file + " :: " + g.extents)
         fo.close()
     except:
-        logger.info("ERROR: Failed to open " + filetrace)
+        print "ERROR: Failed to open " + filetrace
         sys.exit(3)
 # printout (DONE)
 
 def block_ranges(g, file):
-    logger.debug( "block_ranges: " + file)
+    debug_print(g, "block_ranges: " + file)
     # TODO: exclude /proc and /sys mountpoints
     statinfo = os.stat(file)
     mode = statinfo.st_mode
     if stat.S_ISLNK(mode) or stat.ST_SIZE == 0 or not stat.ST_ISREG(mode):
-        logger.debug( "Disqualified file: " + file)
+        debug_print(g, "Disqualified file: " + file)
         return
     mounttype = os.system("mount | grep " + g.device + " | awk '{ print \$5 }'")
     if mounttype == "ext4":
@@ -432,7 +404,7 @@ def block_ranges(g, file):
     elif mounttype == "ext3":
         ioctl_method(g, file)
     else:
-        logger.info("ERROR: " + mounttype + " is not supported yet")
+        print "ERROR: " + mounttype + " is not supported yet"
         sys.exit(4)
     printout(file)
     return
@@ -440,7 +412,7 @@ def block_ranges(g, file):
 
 def find_all_files(g):
     files = []
-    logger.info("FIND ALL FILES")
+    print "FIND ALL FILES"
     os.system("rm -f filetrace.* &>/dev/null")
     cpu_affinity = 0
     filetrace = "filetrace." + g.device_str + "." + str(cpu_affinity) + ".txt"
@@ -451,14 +423,14 @@ def find_all_files(g):
     cmd = "mount | grep " +  g.device + "| awk '{ print \$3 }'"
     (rc, mountpoint) = run_cmd(g, cmd)
     if rc != 0:
-        logger.info(g.device + " not mounted")
+        print g.device + " not mounted"
         os.system("gzip --fast filetrace.* &>/dev/null")
         return
-    logger.warning( "mountpoint: " + mountpoint)
+    verbose_print(g, "mountpoint: " + mountpoint)
 
     cmd = 'mount | grep ' + g.device + " | awk '{ print \$5 }'"
     (rc, mounttype)  = run_cmd(g, cmd)
-    logger.warning( "mounttype: " + mounttype)
+    verbose_print(g, "mounttype: " + mounttype)
 
     ioprof_file = 'ioprof_files.' + g.device_str + '.txt'
     cmd = 'find ' + mountpoint + ' -xdev -name "*" > ' + ioprof_file
@@ -466,11 +438,11 @@ def find_all_files(g):
     with open(ioprof_file, "r") as fo:
         for line in fo:
             g.files.append(line)
-            logger.debug( line)
+            debug_print(g, line)
     fo.close()
 
     file_count = len(g.files)
-    logger.debug( "filecount: " + file_count)
+    debug_print(g, "filecount: " + file_count)
 
     # Single Threaded Method (TODO: Make Multi-threaded)
     k=0
@@ -481,7 +453,7 @@ def find_all_files(g):
             k=0
         k = k + 1
         file = g.files[i]
-        logger.debug("file: " + file)
+        debug_print("file: " + file)
         block_ranges(file)
         
     os.system("gzip --fast filetrace.* &>/dev/null")
@@ -499,29 +471,29 @@ def bucket_to_file_list(g, bucket_id):
 # bucket_to_file_list (DONE)
 
 def file_to_bucket_helper(g, f):
-    for file, r in f.items():
+    for file, r in f.iteritems():
         #g.file_hit_count_semaphore.acquire()
         #g.file_hit_count[file]=0 # Initialize file hit count
         #g.file_hit_count_semaphore.release()
         tempstr = f[file]
-        logger.debug( "f=" + file + " r=" + r)
+        debug_print(g, "f=" + file + " r=" + r)
         x=0
         for range in tempstr.split(' '):
             if range == ' ' or range == '':
                 continue # TODO
-            logger.debug( 'r(' + str(x) + ')=' + range)
+            debug_print(g, 'r(' + str(x) + ')=' + range)
             x+=1
             try:
                 (start, finish) = range.split(':')
             except:
                 continue
-            logger.debug( file + " start=" + start + ", finish=" + finish)
+            debug_print(g, file + " start=" + start + ", finish=" + finish)
             if start == '' or finish == '':
                 continue
             start_bucket  = lba_to_bucket(g, start)
             finish_bucket = lba_to_bucket(g, finish)
     
-            logger.debug( file + " s_lba=" + start + " f_lba=" + finish + " s_buc=" + str(start_bucket) + "f_buc=" + str(finish_bucket ))
+            debug_print(g, file + " s_lba=" + start + " f_lba=" + finish + " s_buc=" + str(start_bucket) + "f_buc=" + str(finish_bucket ))
             #print "WAITING ON LOCK"
             i=start_bucket
             #print "GOT LOCK!"
@@ -541,18 +513,18 @@ def file_to_bucket_helper(g, f):
                 i+=1
                 continue
 
-                logger.debug( "i=" + str(i))
+                debug_print(g, "i=" + str(i))
                 if i in g.bucket_to_files:
                     pattern = re.escape(file)
                     match = re.search(pattern, g.bucket_to_files[i])
                     try:
                         match.group(0)
                     except:
-                        logger.debug( "No Match!  FILE=" + pattern + " PATTERN=" + g.bucket_to_files[i])
+                        debug_print(g, "No Match!  FILE=" + pattern + " PATTERN=" + g.bucket_to_files[i])
                         g.bucket_to_files[i] = g.bucket_to_files[i] + file + " "
                 else:
                     g.bucket_to_files[i] = file + " "
-                logger.debug( "i=" + str(i) + "file_to_buckets: " + g.bucket_to_files[i])
+                debug_print(g, "i=" + str(i) + "file_to_buckets: " + g.bucket_to_files[i])
                 i+=1
     return
 
@@ -560,8 +532,7 @@ def file_to_bucket_helper(g, f):
 def file_to_buckets(g):
     k=0
     size = len(g.files_to_lbas)
-    logger.info(f"files_to_lbas={size}")
-    logger.info("Moving some memory around.  This will take a few seconds...")
+    print "Moving some memory around.  This will take a few seconds..."
     f = dict(g.files_to_lbas)
     temp = {}
     plist = []
@@ -569,7 +540,7 @@ def file_to_buckets(g):
 
     #if g.single_threaded == False:
     if False:
-        for file, r in f.items():
+        for file, r in f.iteritems():
             g.file_hit_count[file]=0 # Initialize file hit count
             temp[file] = r
             k+=1
@@ -611,51 +582,51 @@ def file_to_buckets(g):
                         plist.remove(p)
             time.sleep(0.10)
     
-        logger.info("\rDone correlating files to buckets.  Now time to count bucket hits")
+        print "\rDone correlating files to buckets.  Now time to count bucket hits"
         return
     else:
-        logger.debug("HERE!")
-        for file, r in f.items():
+    
+        for file, r in f.iteritems():
             k+=1
             if k % 100 == 0:
                 printf("\rfile_to_buckets: %d %% (%d of %d)", (k*100 / size), k, size)
                 sys.stdout.flush()
             g.file_hit_count[file]=0 # Initialize file hit count
             tempstr = f[file]
-            logger.debug( "f=" + file + " r=" + r)
+            debug_print(g, "f=" + file + " r=" + r)
             x=0
             for range in tempstr.split(' '):
                 if range == ' ' or range == '':
                     continue # TODO
-                logger.debug( 'r(' + str(x) + ')=' + range)
+                debug_print(g, 'r(' + str(x) + ')=' + range)
                 x+=1
                 try:
                     (start, finish) = range.split(':')
                 except:
                     continue
-                logger.debug( file + " start=" + start + ", finish=" + finish)
+                debug_print(g, file + " start=" + start + ", finish=" + finish)
                 if start == '' or finish == '':
                     continue
                 start_bucket  = lba_to_bucket(g, start)
                 finish_bucket = lba_to_bucket(g, finish)
     
-                logger.debug( file + " s_lba=" + start + " f_lba=" + finish + " s_buc=" + str(start_bucket) + "f_buc=" + str(finish_bucket ))
+                debug_print(g, file + " s_lba=" + start + " f_lba=" + finish + " s_buc=" + str(start_bucket) + "f_buc=" + str(finish_bucket ))
                 i=start_bucket
                 while i<= finish_bucket:
-                    logger.debug( "i=" + str(i))
+                    debug_print(g, "i=" + str(i))
                     if i in g.bucket_to_files:
                         pattern = re.escape(file)
                         match = re.search(pattern, g.bucket_to_files[i])
                         try:
                             match.group(0)
                         except:
-                            logger.debug( "No Match!  FILE=" + pattern + " PATTERN=" + g.bucket_to_files[i])
+                            debug_print(g, "No Match!  FILE=" + pattern + " PATTERN=" + g.bucket_to_files[i])
                             g.bucket_to_files[i] = g.bucket_to_files[i] + file + " "
                     else:
                         g.bucket_to_files[i] = file + " "
-                    logger.debug( "i=" + str(i) + "file_to_buckets: " + g.bucket_to_files[i])
+                    debug_print(g, "i=" + str(i) + "file_to_buckets: " + g.bucket_to_files[i])
                     i+=1
-        logger.info("\rDone correlating files to buckets.  Now time to count bucket hits")
+        print "\rDone correlating files to buckets.  Now time to count bucket hits"
         return
 # file_to_buckets (DONE)
 
@@ -665,11 +636,11 @@ def add_file_hits(g, bucket_id, io_count):
     size = len(list)
     #print list
     if size == 0 and io_count != 0:
-        logger.debug( "No file hit.  bucket=" + str(bucket_id) + ", io_cnt=" + str(io_count))
+        debug_print(g, "No file hit.  bucket=" + str(bucket_id) + ", io_cnt=" + str(io_count))
 
     for file in list.split(' '):
         if file != '': 
-            logger.debug( "file=" + file)
+            debug_print(g, "file=" + file)
             try:
                 g.file_hit_count[file] += io_count
             except:
@@ -679,7 +650,7 @@ def add_file_hits(g, bucket_id, io_count):
 
 ### Get logrithmic theta for Zipfian distribution
 def theta_log(g, base, value):
-    logger.debug( "base=" + str(base) + ", value=" + str(value))
+    debug_print(g, "base=" + str(base) + ", value=" + str(value))
     if value == 0 or base == 0:
         return 0
     else:
@@ -704,9 +675,9 @@ def print_results(g):
     histogram_iops=[]
     histogram_bw=[]
     
+
     g.verbose=True
-    logger.warning( "num_buckets=" + str(g.num_buckets) + " bucket_size=" + str(g.bucket_size))
-    
+    verbose_print(g, "num_buckets=" + str(g.num_buckets) + " bucket_size=" + str(g.bucket_size))
     g.verbose=False
     if g.pdf == True:
         # TODO
@@ -744,14 +715,14 @@ def print_results(g):
             counts[bucket_total] += 1
         else:
             counts[bucket_total] = 1
-        #logger.debug( "bucket_total=" + str(bucket_total) + " counts[b_bucket_total]=" + str(counts[bucket_total]))
+        debug_print(g, "bucket_total=" + str(bucket_total) + " counts[b_bucket_total]=" + str(counts[bucket_total]))
         read_sum += r
         write_sum += w
         buffer = buffer + ("%d " %  bucket_total)
         column += 1
         i+=1
 
-    logger.info("\r                             ")
+    print "\r                             "
     while (i % g.x_width) != 0:
         i+=1
         buffer = buffer + "0 "
@@ -760,7 +731,7 @@ def print_results(g):
         # TODO
         pass
 
-    logger.warning( "num_buckets=%s pfgp iot=%s bht=%s r_sum=%s w_sum=%s yheight=%s" % (g.num_buckets, g.io_total.value, g.bucket_hits_total.value, read_sum, write_sum, g.y_height))
+    verbose_print(g, "num_buckets=%s pfgp iot=%s bht=%s r_sum=%s w_sum=%s yheight=%s" % (g.num_buckets, g.io_total.value, g.bucket_hits_total.value, read_sum, write_sum, g.y_height))
 
     t=0
     j=0
@@ -793,7 +764,7 @@ def print_results(g):
     #
     # Iterate through each key in decending order
     for total in sorted(counts, reverse=True):
-        logger.debug( "total=" + str(total) + " counts=" + str(counts[total]))
+        debug_print(g, "total=" + str(total) + " counts=" + str(counts[total]))
         if total > 0:
             tot += total * counts[total]
             if max_set == 0:
@@ -807,7 +778,7 @@ def print_results(g):
                     max_theta = cur_theta
                 if cur_theta < min_theta:
                     min_theta = cur_theta
-                logger.debug( "cur_theta=" + str(cur_theta))
+                debug_print(g, "cur_theta=" + str(cur_theta))
                 theta_total += cur_theta
             i=0
             while i<counts[total]:
@@ -815,7 +786,7 @@ def print_results(g):
                 b_count += 1
                 bw_count += total * g.bucket_size
                 if ((b_count * g.bucket_size )/ g.GiB) > (g.percent * g.total_capacity_gib):
-                    logger.debug( "b_count:" + str(b_count))
+                    debug_print(g, "b_count:" + str(b_count))
                     bw_tot += bw_count
                     gb_tot += (b_count * g.bucket_size)
                     io_sum += section_count
@@ -826,7 +797,7 @@ def print_results(g):
                         io_sum_perc = "NA"
                         bw_perc = "NA"
                     else:
-                        logger.debug( "b_count=" + str(b_count) + " s=" + str(section_count) + " ios=" + str(io_sum) + " bwc=" + str(bw_count))
+                        debug_print(g, "b_count=" + str(b_count) + " s=" + str(section_count) + " ios=" + str(io_sum) + " bwc=" + str(bw_count))
                         io_perc = "%.1f" % ((float(section_count) / float(g.bucket_hits_total.value)) * 100.0)
                         io_sum_perc = "%.1f" % ((float(io_sum) / float(g.bucket_hits_total.value)) * 100.0)
                         if bw_total == 0:
@@ -847,7 +818,7 @@ def print_results(g):
                     
                 i += 1
     if b_count:
-        logger.debug( "b_count: " + str(b_count))
+        debug_print(g, "b_count: " + str(b_count))
         bw_tot += bw_count
         gb_tot += b_count * g.bucket_size
         io_sum += section_count
@@ -880,13 +851,13 @@ def print_results(g):
         # TODO
         pass
 
-    logger.debug( "t=" + str(t))
+    debug_print(g, "t=" + str(t))
 
-    logger.info("--------------------------------------------")
-    logger.info("Histogram IOPS:")
+    print "--------------------------------------------"
+    print "Histogram IOPS:"
     for entry in histogram_iops:
-        logger.info(entry)
-    logger.info("--------------------------------------------")
+        print entry
+    print "--------------------------------------------"
 
     # TODO: Check that this is consistent with Perl version
     if (theta_count):
@@ -894,30 +865,30 @@ def print_results(g):
         med_theta = ((max_theta - min_theta) / 2 ) + min_theta
         approx_theta = (avg_theta + med_theta) / 2
         #string = "avg_t=%s med_t=%s approx_t=%s min_t=%s max_t=%s\n" % (avg_theta, med_theta, approx_theta, min_theta, max_theta)
-        logger.warning( "avg_t=%s med_t=%s approx_t=%s min_t=%s max_t=%s\n" % (avg_theta, med_theta, approx_theta, min_theta, max_theta))
+        verbose_print(g, "avg_t=%s med_t=%s approx_t=%s min_t=%s max_t=%s\n" % (avg_theta, med_theta, approx_theta, min_theta, max_theta))
         analysis_histogram_iops = "Approximate Zipfian Theta Range: %0.4f-%0.4f (est. %0.4f).\n" % (min_theta, max_theta, approx_theta)
-        logger.info(analysis_histogram_iops)
+        print analysis_histogram_iops
 
-    logger.debug( "Trace_files: " + str(g.trace_files))
+    debug_print(g, "Trace_files: " + str(g.trace_files))
     if g.trace_files:
         top_count=0
-        logger.info("--------------------------------------------")
-        logger.info("Top files by IOPS:")
-        logger.info("Total I/O's: " + str(g.bucket_hits_total.value))
+        print "--------------------------------------------"
+        print "Top files by IOPS:"
+        print "Total I/O's: " + str(g.bucket_hits_total.value)
         if g.bucket_hits_total.value == 0:
-            logger.info("No Bucket Hits")
+            print "No Bucket Hits"
         else:    
             for filename in sorted(g.file_hit_count, reverse=True, key=g.file_hit_count.get):
                 hits = g.file_hit_count[filename]
                 if hits > 0:
                     hit_rate = (float(hits) / float(g.bucket_hits_total.value)) * 100.0
-                    logger.info("%0.2f%% (%d) %s" % (hit_rate, hits, filename))
+                    print "%0.2f%% (%d) %s" % (hit_rate, hits, filename)
                     if g.pdf:
-                        g.top_files.append("%0.2f%%: (%d) %s\n" % (hit_rate, hits, filename))
+                        g.top_files = append("%0.2f%%: (%d) %s\n" % (hit_rate, hits, filename))
                 top_count += 1
                 if top_count > g.top_count_limit:
                     break
-        logger.info("--------------------------------------------")
+        print "--------------------------------------------"
     
     return
 # print_results (IN PROGRESS)
@@ -950,74 +921,72 @@ def print_stats(g):
 
 ### Combine thread-local counts into global counts
 def total_thread_counts (g, num):
-    logger.debug("total_thread_counts total_thread_counts total_thread_counts total_thread_counts")
 
     g.max_bucket_hits_semaphore.acquire()
-    logger.debug( "Thread " + str(num) + " has max_bucket_hits lock t=" + str(g.thread_max_bucket_hits) + " g=" + str(g.max_bucket_hits.value))
+    debug_print(g, "Thread " + str(num) + " has max_bucket_hits lock t=" + str(g.thread_max_bucket_hits) + " g=" + str(g.max_bucket_hits.value))
     if(g.thread_max_bucket_hits > g.max_bucket_hits.value):
         g.max_bucket_hits.value = g.thread_max_bucket_hits
-    logger.debug( "Thread " + str(num) + " releasing max_bucket_hits lock t=" + str(g.thread_max_bucket_hits) + " g=" + str(g.max_bucket_hits.value))
+    debug_print(g, "Thread " + str(num) + " releasing max_bucket_hits lock t=" + str(g.thread_max_bucket_hits) + " g=" + str(g.max_bucket_hits.value))
     g.max_bucket_hits_semaphore.release()
 
     g.total_blocks_semaphore.acquire()
-    logger.debug( "Thread " + str(num) + " has total_blocks lock t=" + str(g.thread_total_blocks) + " g=" + str(g.total_blocks.value))
+    debug_print(g, "Thread " + str(num) + " has total_blocks lock t=" + str(g.thread_total_blocks) + " g=" + str(g.total_blocks.value))
     g.total_blocks.value += g.thread_total_blocks
-    logger.debug( "Thread " + str(num) + " releasing total_blocks lock t=" + str(g.thread_total_blocks) + " g=" + str(g.total_blocks.value))
+    debug_print(g, "Thread " + str(num) + " releasing total_blocks lock t=" + str(g.thread_total_blocks) + " g=" + str(g.total_blocks.value))
     g.total_blocks_semaphore.release()
 
     g.total_semaphore.acquire()
-    logger.debug( "Thread " + str(num) + " has total lock t=" + str(g.thread_io_total) + " g=" + str(g.io_total.value))
+    debug_print(g, "Thread " + str(num) + " has total lock t=" + str(g.thread_io_total) + " g=" + str(g.io_total.value))
     g.io_total.value += g.thread_io_total
-    logger.debug( "Thread " + str(num) + " releasing total lock t=" + str(g.thread_io_total) + " g=" + str(g.io_total.value))
+    debug_print(g, "Thread " + str(num) + " releasing total lock t=" + str(g.thread_io_total) + " g=" + str(g.io_total.value))
     g.total_semaphore.release()
 
     g.read_totals_semaphore.acquire()
-    logger.debug( "Thread " + str(num) + " has read_totals lock t=" + str(g.thread_read_total) + " g=" + str(g.read_total.value))
+    debug_print(g, "Thread " + str(num) + " has read_totals lock t=" + str(g.thread_read_total) + " g=" + str(g.read_total.value))
     g.read_total.value += g.thread_read_total
-    for io_size, hits in g.thread_r_totals.items():
+    for io_size, hits in g.thread_r_totals.iteritems():
         if io_size in g.r_totals:
             g.r_totals[io_size] += hits
         else:
             g.r_totals[io_size] = hits
-    logger.debug( "Thread " + str(num) + " releasing read_totals lock t=" + str(g.thread_read_total) + " g=" + str(g.read_total.value))
+    debug_print(g, "Thread " + str(num) + " releasing read_totals lock t=" + str(g.thread_read_total) + " g=" + str(g.read_total.value))
     g.read_totals_semaphore.release()
 
     g.write_totals_semaphore.acquire()
-    logger.debug( "Thread " + str(num) + " has write_totals lock t=" + str(g.thread_write_total) + " g=" + str(g.write_total.value))
+    debug_print(g, "Thread " + str(num) + " has write_totals lock t=" + str(g.thread_write_total) + " g=" + str(g.write_total.value))
     g.write_total.value += g.thread_write_total
-    for io_size, hits in g.thread_w_totals.items():
+    for io_size, hits in g.thread_w_totals.iteritems():
         if io_size in g.w_totals:
             g.w_totals[io_size] += hits
         else:
             g.w_totals[io_size] = hits
-    logger.debug( "Thread " + str(num) + " releasing write_totals lock t=" + str(g.thread_write_total) + " g=" + str(g.write_total.value))
+    debug_print(g, "Thread " + str(num) + " releasing write_totals lock t=" + str(g.thread_write_total) + " g=" + str(g.write_total.value))
     g.write_totals_semaphore.release()
 
     g.read_semaphore.acquire()
-    logger.debug( "Thread " + str(num) + " has read lock.")
-    for bucket,value in g.thread_reads.items():
-        print(f"bucket={bucket}")
+    debug_print(g, "Thread " + str(num) + " has read lock.")
+    for bucket,value in g.thread_reads.iteritems():
         try:
             g.reads[bucket] += value
         except:
             g.reads[bucket] = value
-        logger.debug( "Thread " + str(num) + " has read lock.  Bucket=" + str(bucket) + " Value=" + str(value) + " g.reads[bucket]=" + str(g.reads[bucket]))
+        debug_print(g, "Thread " + str(num) + " has read lock.  Bucket=" + str(bucket) + " Value=" + str(value) + " g.reads[bucket]=" + str(g.reads[bucket]))
     g.read_semaphore.release()
 
     g.write_semaphore.acquire()
-    logger.debug( "Thread " + str(num) + " has write lock.")
-    for bucket,value in g.thread_writes.items():
+    debug_print(g, "Thread " + str(num) + " has write lock.")
+    for bucket,value in g.thread_writes.iteritems():
         try:
             g.writes[bucket] += value
         except:
             g.writes[bucket] = value
-        logger.debug( "Thread " + str(num) + " has write lock.  Bucket=" + str(bucket) + " Value=" + str(value) + " g.writes[bucket]=" + str(g.writes[bucket]))
+        debug_print(g, "Thread " + str(num) + " has write lock.  Bucket=" + str(bucket) + " Value=" + str(value) + " g.writes[bucket]=" + str(g.writes[bucket]))
     g.write_semaphore.release()
 
     g.total_semaphore.acquire()
-    logger.debug( "Thread " + str(num) + " has total lock t=" + str(g.thread_bucket_hits_total) + " g=" + str(g.bucket_hits_total.value))
+    debug_print(g, "Thread " + str(num) + " has total lock t=" + str(g.thread_bucket_hits_total) + " g=" + str(g.bucket_hits_total.value))
     g.bucket_hits_total.value += g.thread_bucket_hits_total
-    logger.debug( "Thread " + str(num) + " releasing total lock t=" + str(g.thread_bucket_hits_total) + " g=" + str(g.bucket_hits_total.value))
+    debug_print(g, "Thread " + str(num) + " releasing total lock t=" + str(g.thread_bucket_hits_total) + " g=" + str(g.bucket_hits_total.value))
     g.total_semaphore.release()
 
     return
@@ -1025,49 +994,46 @@ def total_thread_counts (g, num):
 
 ### Thread parse routine for blktrace output
 def thread_parse(g, file, num):
-    logger.debug("thread_parse")
-    logger.debug("========================")
+    #print "thread_parse\n"
     linecount = 0
     os.system("gunzip " + file + ".gz")
-    logger.debug( "\nSTART: " +  file + " " + str(num) + "\n")
+    debug_print(g, "\nSTART: " +  file + " " + str(num) + "\n")
     try:
-        with open(file, "r") as fo:
-
-            count=0
-            hit_count = 0
-            for line in fo:
-                count += 1
-                result_set = regex_find(g, '(\S+)\s+Q\s+(\S+)\s+(\S+)$', line)
-                if result_set != False:
-                    #(a, b, c) = regex_find('.*Q.*', line)
-                    hit_count += 1
-                    #print len(set)
-                    #print "a=" + a + " b=" + b + " c=" + c + "\n"
-                    #print set
-                    #sys.stdout.flush()
-                    try:
-                        #logger.debug("HIT HIT HIT")
-                        parse_me(g, result_set[0], int(result_set[1]), int(result_set[2]))
-                    except:
-                        pass
-                #sys.stdout.flush()
-
-        total_thread_counts(g, num)
-        logger.debug(  "\n FINISH" + file +  " (" + str(count) + " lines) [hit_count=" + str(hit_count) + "]" + str(g.thread_io_total) + "\n")
-        rc = os.system("rm -f " + file)
-    except BaseException as base_e:
-        logger.error(f"ERROR: Failed to open {file}: {base_e}")
+        fo = open(file, "r")
+    except:
+        print "ERROR: Failed to open " + file
         sys.exit(3)
-    return g
+    else:
+        count=0
+        hit_count = 0
+        for line in fo:
+            count += 1
+            result_set = regex_find(g, '(\S+)\s+Q\s+(\S+)\s+(\S+)$', line)
+            if result_set != False:
+                #(a, b, c) = regex_find('.*Q.*', line)
+                hit_count += 1
+                #print len(set)
+                #print "a=" + a + " b=" + b + " c=" + c + "\n"
+                #print set
+                #sys.stdout.flush()
+                try:
+                    parse_me(g, result_set[0], int(result_set[1]), int(result_set[2]))
+                except:
+                    pass
+            #sys.stdout.flush()
+        fo.close()
+        total_thread_counts(g, num)
+        debug_print(g,  "\n FINISH" + file +  " (" + str(count) + " lines) [hit_count=" + str(hit_count) + "]" + str(g.thread_io_total) + "\n")
+        rc = os.system("rm -f " + file)
+    return
 
 # thread_parse (DONE)
 
 ### Parse blktrace output
 def parse_me(g, rw, lba, size):
-    #logger.debug(  "rw=" + rw + " lba=" + str(lba) + " size=" + str(size))
+    debug_print(g,  "rw=" + rw + " lba=" + str(lba) + " size=" + str(size))
     if (rw == 'R') or (rw == 'RW'):
         # Read
-        #logger.debug("read")
         g.thread_total_blocks += int(size)
         g.thread_io_total += 1
         g.thread_read_total += 1
@@ -1076,10 +1042,9 @@ def parse_me(g, rw, lba, size):
         else:
             g.thread_r_totals[size] = 1
         bucket_hits = (size * g.sector_size) / g.bucket_size
-        bucket_hits = 1 # BEN
         if ((size * g.sector_size) % g.bucket_size) != 0:
             bucket_hits += 1
-        for i in range(0, bucket_hits):
+        for i in xrange(0, bucket_hits):
             bucket = int((lba * g.sector_size) / g.bucket_size) + i
             if bucket > g.num_buckets:
                 # Not sure why, but we occassionally get buckets beyond our max LBA range
@@ -1099,7 +1064,6 @@ def parse_me(g, rw, lba, size):
             g.thread_bucket_hits_total += 1
     elif (rw == 'W') or (rw == 'WS'):
         # Write
-        #logger.debug("write")
         g.thread_total_blocks += int(size)
         g.thread_io_total += 1
         g.thread_write_total += 1
@@ -1108,11 +1072,9 @@ def parse_me(g, rw, lba, size):
         else:
             g.thread_w_totals[size] = 1
         bucket_hits = (size * g.sector_size) / g.bucket_size
-        bucket_hits = 1 # BEN
-        #print(bucket_hits)
         if ((size * g.sector_size) % g.bucket_size) != 0:
             bucket_hits += 1
-        for i in range(0, bucket_hits):
+        for i in xrange(0, bucket_hits):
             bucket = int((lba * g.sector_size) / g.bucket_size) + i
             if bucket > g.num_buckets:
                 # Not sure why, but we occassionally get buckets beyond our max LBA range
@@ -1135,14 +1097,13 @@ def parse_me(g, rw, lba, size):
 
 ## File trace routine
 def parse_filetrace(g, filename, num):
-    print("PARSE_FILETRACE") # BEN
     thread_files_to_lbas = {}
     os.system("gunzip " + filename + ".gz")
-    logger.debug( "tracefile = " + filename + " " + str(num) + "\n")
+    debug_print(g, "tracefile = " + filename + " " + str(num) + "\n")
     try:
         fo = open(filename, "r")
     except Exception as e:
-        logger.info("ERROR: Failed to open " + filename + " Err: ", e)
+        print "ERROR: Failed to open " + filename + " Err: ", e
         sys.exit(3)
     else:
         for line in fo:
@@ -1151,16 +1112,16 @@ def parse_filetrace(g, filename, num):
                 object = result_set[0]
                 ranges = result_set[1]
                 thread_files_to_lbas[object] = ranges
-                logger.debug( filename + ": obj=" + object + " ranges:" + ranges + "\n")
+                debug_print(g, filename + ": obj=" + object + " ranges:" + ranges + "\n")
         fo.close()
 
-        logger.debug( "Thread " + str(num) + "wants file_to_lba lock for " + filename + "\n")
+        debug_print(g, "Thread " + str(num) + "wants file_to_lba lock for " + filename + "\n")
         g.files_to_lbas_semaphore.acquire()
-        for key,value in thread_files_to_lbas.items():
+        for key,value in thread_files_to_lbas.iteritems():
             g.files_to_lbas[key] = value
-            logger.debug( "k=" + str(key) + " value=" + str(g.files_to_lbas[key]))
+            debug_print(g, "k=" + str(key) + " value=" + str(g.files_to_lbas[key]))
         g.files_to_lbas_semaphore.release()
-        logger.debug( "Thread " + str(num) + "freed file_to_lba lock for " + filename + "\n")
+        debug_print(g, "Thread " + str(num) + "freed file_to_lba lock for " + filename + "\n")
 
     return
 # parse_filetrace (DONE)
@@ -1172,19 +1133,19 @@ def choose_color(g, num):
     g.color_index = num / g.vpc
     if (g.color_index > (g.choices - 1)):
         g.debug = True
-        logger.debug( "HIT! num=" + num)
+        debug_print(g, "HIT! num=" + num)
         g.debug = False
         g.color_index=7
         return g.red
     color = g.colors[g.color_index]
-    logger.debug( "cap=" + g.cap + " num=" + num + " ci=" + g.color_index + " vpc=" + g.vpc + " cap=" + g.cap)
+    debug_print(g, "cap=" + g.cap + " num=" + num + " ci=" + g.color_index + " vpc=" + g.vpc + " cap=" + g.cap)
     return color
 # choose_color (DONE)
 
 ### Clear Screen for heatmap (UNUSED)
 def clear_screen(g):
-    logger.info("\033[2J")
-    logger.info("\[\033[0;0f\]\r")
+    print "\033[2J"
+    print "\[\033[0;0f\]\r"
     return
 # clear_screen (DONE)
 
@@ -1195,7 +1156,7 @@ def get_value(g, offset, rate):
     sum = 0
 
     g.debug = True
-    logger.debug( "start=" + start + " end=" + end)
+    debug_print(g, "start=" + start + " end=" + end)
     g.debug = False
 
     index=start
@@ -1210,78 +1171,11 @@ def get_value(g, offset, rate):
         sum = sum + r + w
 
     g.debug = True
-    logger.debug( "s=" + sum)
+    debug_print(g, "s=" + sum)
     g.debug = False
 
     return sum
 # get_value (DONE)
-
-def input_tar_files(g):
-    cmd = 'tar -tf ' + g.tarfile 
-    logger.debug(g.tarfile)
-    (rc, file_text) = run_cmd(g, cmd)
-    file_text = file_text.decode("utf-8")
-    logger.debug( file_text)
-    
-    g.file_list = []
-    for i in file_text.split("\n"):
-        logger.debug( "i=" + i)
-        if i != "":
-            g.file_list.append(i)
-    if rc != 0:
-        logger.info("ERROR: Failed to test input file: " + g.tarfile)
-        sys.exit(9)
-
-    logger.info("Unpacking " + g.tarfile + ".  This may take a minute")
-    cmd = 'tar -xvf ' + g.tarfile
-    (rc, out) = run_cmd(g, cmd)
-    if rc != 0:
-        logger.info("ERROR: Failed to unpack input file: " + g.tarfile)
-        sys.exit(9)
-    else:
-        logger.debug("Untar completed successfully")
-
-    # Get fdisk info
-    rc=0
-    out=""
-    (rc, out) = run_cmd(g, 'cat '+ g.fdisk_file )
-    out = out.decode("utf-8")
-    logger.info(out)
-    result = regex_find(g, "Units = sectors of \d+ \S \d+ = (\d+) bytes", out)
-    if result == False:
-        #Units: sectors of 1 * 512 = 512 bytes
-        result = regex_find(g, "Units: sectors of \d+ \* \d+ = (\d+) bytes", out)
-        if result == False:
-            logger.error("ERROR: Sector Size Invalid")
-            logger.error(out)
-            sys.exit()
-    g.sector_size = int(result[0])
-    logger.warning( "sector size="+ str(g.sector_size))
-    result = regex_find(g, ".+ total (\d+) sectors", out)
-    if result == False:
-        #Disk /dev/sdb: 111.8 GiB, 120034123776 bytes, 234441648 sectors
-        result = regex_find(g, "Disk /dev/\w+: \d+.\d+ [GT]iB, \d+ bytes, (\d+) sectors", out)
-        if result == False:
-            logger.info("ERROR: Total LBAs is Invalid")
-            sys.exit()
-    g.total_lbas  = int(result[0])
-    logger.warning( "sector count ="+ str(g.total_lbas))
-
-    result = regex_find(g, "Disk (\S+): \S+ GB, \d+ bytes", out)
-    if result == False:
-        # LINE:  Disk /dev/sdb: 111.8 GiB, 120034123776 bytes, 234441648 sectors
-        result = regex_find(g, "Disk (\S+):", out)
-        if result == False:
-
-            logger.info("ERROR: Device Name is Invalid")
-            sys.exit()
-    g.device = result[0]
-    logger.warning( "dev="+ g.device + " lbas=" + str(g.total_lbas) + " sec_size=" + str(g.sector_size))
-
-    g.total_capacity_gib = g.total_lbas * g.sector_size / g.GiB
-    printf("lbas: %d sec_size: %d total: %0.2f GiB\n", g.total_lbas, g.sector_size, g.total_capacity_gib)
-
-    g.num_buckets = g.total_lbas * g.sector_size // g.bucket_size
 
 ### Draw heatmap on color terminal
 def draw_heatmap(g):
@@ -1290,9 +1184,9 @@ def draw_heatmap(g):
 
 ### Cleanup temp files
 def cleanup_files(g):
-    logger.warning( "Cleaning up temp files\n")
+    verbose_print(g, "Cleaning up temp files\n")
     for file in g.cleanup:
-        logger.debug( file)
+        debug_print(g, file)
         os.system("rm -f " + file)
     os.system("rm -f filetrace.*.txt")
     return
@@ -1302,21 +1196,21 @@ def cleanup_files(g):
 def run_cmd(g, cmd):
     rc  = 0
     out = ""
-    logger.debug( "cmd: " + cmd)
+    debug_print(g, "cmd: " + cmd)
     args = shlex.split(cmd)
     
     try:
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except:
-        logger.info("ERROR: problem with Popen")
+        print "ERROR: problem with Popen"
         sys.exit(1)
     try: 
         out, error = p.communicate()
     except:
-        logger.info("ERROR: problem with Popen.communicate()")
+        print "ERROR: problem with Popen.communicate()"
     rc = p.returncode
     if rc == 0:
-        logger.debug( "rc=" + str(p.returncode))
+        debug_print(g, "rc=" + str(p.returncode))
     return (rc, out)
         
 # run_cmd
@@ -1324,13 +1218,16 @@ def run_cmd(g, cmd):
 ### regex_find
 def regex_find(g, pattern, input):
     output = False
-    #logger.debug(f"PATTERN: {pattern}")
+    if g.verbose == True or g.debug == True:
+        print "PATTERN: ", pattern
     for line in input.split("\n"):
-        #logger.debug(f"LINE: {line}")
+        if g.verbose == True or g.debug == True:
+            print "LINE: ", line
         match = re.search(pattern, line)
         if match != None:
             output =  match.groups()
-            #logger.debug('MATCHED pattern')
+            if g.verbose == True or g.debug == True:
+                print 'MATCHED pattern'
             break
     return output
 # regex_find
@@ -1339,34 +1236,12 @@ def printf(format, *args):
     sys.stdout.write(format % args)
 # printf (DONE)
 
-def setup_logger(logger):
-    # Create and configure logger
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format=log_format,
-        handlers=[
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    # Creating an object
-    logger = logging.getLogger()
-
-    # Setting the threshold of logger to INFO
-    logger.setLevel(logging.INFO)
-    return logger
-
 ### MAIN
 def main(argv):
-    global logger
-    logger = setup_logger(logger)
-
-    # Globals
     g = global_variables()
-    logger.info(f"VERSION: {g.version}")
+    print "VERSION: ", g.version
 
-    #check_args(g, argv) # BEN Remove
-    command_args = get_arguments(argv)
-    set_globals(g, command_args)
+    check_args(g, argv)
 
     if g.mode == 'live' or g.mode == 'trace':
         mount_debugfs(g)
@@ -1377,24 +1252,19 @@ def main(argv):
         # Check sudo permissions
         rc = os.system("sudo -v &>/dev/null")
         if rc != 0:
-            logger.info("ERROR: You need to have sudo permissions to collect all necessary data.  Please run from a privilaged account.")
+            print "ERROR: You need to have sudo permissions to collect all necessary data.  Please run from a privilaged account."
             sys.exit(6)
         # Save fdisk info
-        logger.debug( "Running fdisk")
+        debug_print(g, "Running fdisk")
         fdisk_version = ""
         (rc, fdisk_version) = run_cmd(g, "fdisk -v")
-        logger.debug( fdisk_version)
-        fdisk_version = fdisk_version.decode("utf-8")
         match = re.search("util-linux-ng", fdisk_version)
         if match:
             # RHEL 6.x
-            rc = os.system("sudo fdisk -ul "+g.device+" > fdisk."+g.device_str)
+            os.system("fdisk -ul "+g.device+" > fdisk."+g.device_str)
         else:
             # RHEL 7.x
-            rc = os.system("sudo fdisk -l -u=sectors "+g.device+" > fdisk."+g.device_str)
-        if rc != 0:
-            logger.error(f"fdisk failed: {rc}")
-            sys.exit(1)
+            os.system("fdisk -l -u=sectors "+g.device+" > fdisk."+g.device_str)
 
         os.system("rm -f blk.out.* &>/dev/null") # Cleanup previous mess
         runcount = g.runtime / g.timeout
@@ -1402,88 +1272,129 @@ def main(argv):
             time_left = runcount * g.timeout
             percent_prog = (g.runtime - time_left) * 100  / g.runtime
             printf( "\r%d %% done (%d seconds left)", percent_prog, time_left)
-            #sys.stdout.flush() # BEN
-            cmd = "sudo blktrace -b " + str(g.buffer_size) + " -n " + str(g.buffer_count) + " -a queue -d " + str(g.device) + " -o blk.out." + str(g.device_str) + ".0 -w " + str(g.timeout) + " 1> /dev/null"
-            logger.debug( cmd)
-
+            # BEN
+            sys.stdout.flush()
+            cmd = "blktrace -b " + str(g.buffer_size) + " -n " + str(g.buffer_count) + " -a queue -d " + str(g.device) + " -o blk.out." + str(g.device_str) + ".0 -w " + str(g.timeout) + " &> /dev/null"
             rc = os.system(cmd)
-
             if rc != 0:
-                logger.info("Unable to run the 'blktrace' tool required to trace all of your I/O")
-                logger.info("If you are using SLES 11 SP1, then it is likely that your default kernel is missing CONFIG_BLK_DEV_IO_TRACE")
-                logger.info("which is required to run blktrace.  This is only available in the kernel-trace version of the kernel.")
-                logger.info("kernel-trace is available on the SLES11 SP1 DVD and you simply need to install this and boot to this")
-                logger.info("kernel version in order to get this working.")
-                logger.info("If you are using a differnt distro or custom kernel, you may need to rebuild your kernel with the 'CONFIG_BLK 1f40 _DEV_IO_TRACE'")
-                logger.info("option enabled.  This should allow blktrace to function\n")
-                logger.info("ERROR: Could not run blktrace")
+                print "Unable to run the 'blktrace' tool required to trace all of your I/O"
+                print "If you are using SLES 11 SP1, then it is likely that your default kernel is missing CONFIG_BLK_DEV_IO_TRACE"
+                print "which is required to run blktrace.  This is only available in the kernel-trace version of the kernel."
+                print "kernel-trace is available on the SLES11 SP1 DVD and you simply need to install this and boot to this"
+                print "kernel version in order to get this working."
+                print "If you are using a differnt distro or custom kernel, you may need to rebuild your kernel with the 'CONFIG_BLK 1f40 _DEV_IO_TRACE'"
+                print "option enabled.  This should allow blktrace to function\n"
+                print "ERROR: Could not run blktrace"
                 sys.exit(7)
-            cmd = "sudo blkparse -i blk.out." + g.device_str + ".0 -q -f " + '" %d %a %S %n\n" | grep -v cfq | gzip --fast > blk.out.' + g.device_str + ".0.blkparse.gz;"
-            logger.debug( cmd)
+            cmd = "blkparse -i blk.out." + g.device_str + ".0 -q -f " + '" %d %a %S %n\n" | grep -v cfq | gzip --fast > blk.out.' + g.device_str + ".0.blkparse.gz;"
             rc = os.system(cmd)
-            if rc != 0:
-                logger.error(f"blkparse returned non-zero return code rc={rc}")
             runcount -= 1
-        logger.info("\rMapping files to block locations                ")
-
+        print "\rMapping files to block locations                "
         if g.trace_files:
             find_all_files(g)
         tarball_name = g.device_str + ".tar"
-        logger.info("\rCreating tarball " + tarball_name)
+        print "\rCreating tarball " + tarball_name
         filetrace = ""
         if g.trace_files:
             filetrace = "filetrace." + g.device_str + ".*.txt.gz"
-        cmd = "tar -cf " + tarball_name + " blk.out." + g.device_str + ".*.gz fdisk." + g.device_str + " " + filetrace + " 1> /dev/null"
-        logger.info(cmd)
+        cmd = "tar -cf " + tarball_name + " blk.out." + g.device_str + ".*.gz fdisk." + g.device_str + " " + filetrace + " &> /dev/null"
+        print cmd
         rc = os.system(cmd)
         if rc != 0:
-            logger.info("ERROR: failed to tarball " + tarball_name)
+            print "ERROR: failed to tarball " + tarball_name
             sys.exit(8)
         cmd = "rm -f blk.out." + g.device_str + ".*.gz; rm -f fdisk." + g.device_str + "; rm -f filetrace." + g.device_str + ".*.gz"
         rc = os.system(cmd)
-        logger.info("\rFINISHED tracing: " + tarball_name)
+        print "\rFINISHED tracing: " + tarball_name
         name = os.path.basename(__file__)
-        logger.info("Please use this file with python3 " + name + " -m post -t " + tarball_name + " to create a report")
+        print "Please use this file with " + name + " -m post -t " + tarball_name + " to create a report"
 
     elif g.mode == 'post':
         # Post 
-        #g.THREAD_MAX = multiprocessing.cpu_count() * 4
+        g.THREAD_MAX = multiprocessing.cpu_count() * 4
+        cmd = 'tar -tf ' + g.tarfile 
+        print g.tarfile
+        (rc, file_text) = run_cmd(g, cmd)
+        debug_print(g, file_text)
+        file_list = []
+        for i in file_text.split("\n"):
+            debug_print(g, "i=" + i)
+            if i != "":
+                file_list.append(i)
+        if rc != 0:
+            print "ERROR: Failed to test input file: " + g.tarfile
+            sys.exit(9)
+        print "Unpacking " + g.tarfile + ".  This may take a minute"
+        cmd = 'tar -xvf ' + g.tarfile
+        (rc, out) = run_cmd(g, cmd)
+        if rc != 0:
+            print "ERROR: Failed to unpack input file: " + g.tarfile
+            sys.exit(9)
 
-        # CPU Count
-        cpu_count = multiprocessing.cpu_count()
-        proc_pool = Pool(cpu_count)
+        rc=0
+        out=""
+        (rc, out) = run_cmd(g, 'cat '+ g.fdisk_file )
+        result = regex_find(g, "Units = sectors of \d+ \S \d+ = (\d+) bytes", out)
+        if result == False:
+            #Units: sectors of 1 * 512 = 512 bytes
+            result = regex_find(g, "Units: sectors of \d+ \* \d+ = (\d+) bytes", out)
+            if result == False:
+                print "ERROR: Sector Size Invalid"
+                sys.exit()
+        g.sector_size = int(result[0])
+        verbose_print(g, "sector size="+ str(g.sector_size))
+        result = regex_find(g, ".+ total (\d+) sectors", out)
+        if result == False:
+            #Disk /dev/sdb: 111.8 GiB, 120034123776 bytes, 234441648 sectors
+            result = regex_find(g, "Disk /dev/\w+: \d+.\d+ GiB, \d+ bytes, (\d+) sectors", out)
+            if result == False:
+                print "ERROR: Total LBAs is Invalid"
+                sys.exit()
+        g.total_lbas  = int(result[0])
+        verbose_print(g, "sector count ="+ str(g.total_lbas))
 
-        input_tar_files(g)
+        result = regex_find(g, "Disk (\S+): \S+ GB, \d+ bytes", out)
+        if result == False:
+            # LINE:  Disk /dev/sdb: 111.8 GiB, 120034123776 bytes, 234441648 sectors
+            result = regex_find(g, "Disk (\S+):", out)
+            if result == False:
+                print "ERROR: Device Name is Invalid"
+                sys.exit()
+        g.device = result[0]
+        verbose_print(g, "dev="+ g.device + " lbas=" + str(g.total_lbas) + " sec_size=" + str(g.sector_size))
+
+
+        g.total_capacity_gib = g.total_lbas * g.sector_size / g.GiB
+        printf("lbas: %d sec_size: %d total: %0.2f GiB\n", g.total_lbas, g.sector_size, g.total_capacity_gib)
+
+        g.num_buckets = g.total_lbas * g.sector_size / g.bucket_size
 
         # Make the PDF plot a square matrix to keep gnuplot happy
         g.y_height = g.x_width = int(math.sqrt(g.num_buckets))
-        logger.debug( "x=" + str(g.x_width) + " y=" + str(g.y_height))
+        debug_print(g, "x=" + str(g.x_width) + " y=" + str(g.y_height))
 
-        #g.debug=True
-        logger.debug( "num_buckets=" + str(g.num_buckets) + " sector_size=" + str(g.sector_size) + " total_lbas=" + str(g.total_lbas) + " bucket_size=" + str(g.bucket_size))
-        #g.debug=False
+        g.debug=True
+        debug_print(g, "num_buckets=" + str(g.num_buckets) + " sector_size=" + str(g.sector_size) + " total_lbas=" + str(g.total_lbas) + " bucket_size=" + str(g.bucket_size))
+        g.debug=False
         rc = os.system("rm -f filetrace." + g.device_str + ".*.txt")
         rc = os.system("rm -f blk.out." + g.device_str + ".*.blkparse")
-        logger.info("Time to parse.  Please wait...\n")
+        print "Time to parse.  Please wait...\n"
 
-        size = len(g.file_list)
+        size = len(file_list)
         file_count = 0
 
         plist = []
-        for filename in g.file_list:
-            logger.debug(filename)
-            logger.debug("----------------------")
+        for filename in file_list:
             file_count += 1
-            #perc = file_count * 100 / size
+            perc = file_count * 100 / size
             printf("\rInput Percent: %d %% (File %d of %d) threads=%d", (file_count*100 / size), file_count, size, len(plist))
             sys.stdout.flush()
             result = regex_find(g, "(blk.out.\S+).gz", filename)
             if result != False:
                 new_file = result[0]
-                #if g.single_threaded:
-                if True:
+                if g.single_threaded:
                     thread_parse(g, new_file, file_count)
-                    logger.debug( "blk.out hit = " + filename + "\n")
+                    debug_print(g, "blk.out hit = " + filename + "\n")
                 else:
                     p = Process(target=thread_parse, args=(g, new_file, file_count))
                     plist.append(p)
@@ -1492,10 +1403,10 @@ def main(argv):
             if result != False:
                 new_file = result[0]
                 g.trace_files=True
-                logger.debug( "filetrace hit = " + filename+ "\n")
+                debug_print(g, "filetrace hit = " + filename+ "\n")
                 if g.single_threaded:
                     parse_filetrace(g, new_file, file_count)
-                    logger.debug( "blk.out hit = " + filename + "\n")
+                    debug_print(g, "blk.out hit = " + filename + "\n")
                 else:
                     p = Process(target=parse_filetrace, args=(g, new_file, file_count))
                     plist.append(p)
@@ -1510,12 +1421,11 @@ def main(argv):
                         if not p.is_alive():
                             plist.remove(p)
                 time.sleep(0.10)
-
         if g.single_threaded == False:
             x=1
             while len(plist) > 0:
                 dots=""
-                for i in range(x):
+                for i in xrange(x):
                     dots = dots + "."
                 x+=1
                 if x>3:
@@ -1532,8 +1442,7 @@ def main(argv):
                         if not p.is_alive():
                             plist.remove(p)
                 time.sleep(0.10)
-
-        logger.info("\rFinished parsing files.  Now to analyze         \n")
+        print "\rFinished parsing files.  Now to analyze         \n"
         file_to_buckets(g)
         print_results(g)
         print_stats(g)
@@ -1547,7 +1456,7 @@ def main(argv):
         
     elif g.mode == 'live':
         # Live
-        print ("Live Mode - Coming Soon ...")
+        print "Live Mode - Coming Soon ..."
 
     sys.exit()
 # main (IN PROGRESS)
